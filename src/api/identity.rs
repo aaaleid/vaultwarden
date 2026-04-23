@@ -2,7 +2,6 @@ use chrono::Utc;
 use num_traits::FromPrimitive;
 use rocket::{
     form::{Form, FromForm},
-    http::Status,
     response::Redirect,
     serde::json::Json,
     Route,
@@ -12,9 +11,12 @@ use serde_json::Value;
 use crate::{
     api::{
         core::{
-            accounts::{PreloginData, RegisterData, _prelogin, _register, kdf_upgrade},
+            accounts::{_prelogin, _register, kdf_upgrade, PreloginData, RegisterData},
             log_user_event,
-            two_factor::{authenticator, duo, duo_oidc, email, enforce_2fa_policy, webauthn, yubikey},
+            two_factor::{
+                authenticator, duo, duo_oidc, email, enforce_2fa_policy, is_twofactor_provider_usable, webauthn,
+                yubikey,
+            },
         },
         master_password_policy,
         push::register_push_device,
@@ -128,12 +130,14 @@ async fn login(
     login_result
 }
 
-// Return Status::Unauthorized to trigger logout
 async fn _refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonResult {
-    // Extract token
-    let refresh_token = match data.refresh_token {
-        Some(token) => token,
-        None => err_code!("Missing refresh_token", Status::Unauthorized.code),
+    // When a refresh token is invalid or missing we need to respond with an HTTP BadRequest (400)
+    // It also needs to return a json which holds at least a key `error` with the value `invalid_grant`
+    // See the link below for details
+    // https://github.com/bitwarden/clients/blob/2ee158e720a5e7dbe3641caf80b569e97a1dd91b/libs/common/src/services/api.service.ts#L1786-L1797
+
+    let Some(refresh_token) = data.refresh_token else {
+        err_json!(json!({"error": "invalid_grant"}), "Missing refresh_token")
     };
 
     // ---
@@ -144,7 +148,10 @@ async fn _refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> Json
     // let members = Membership::find_confirmed_by_user(&user.uuid, conn).await;
     match auth::refresh_tokens(ip, &refresh_token, data.client_id, conn).await {
         Err(err) => {
-            err_code!(format!("Unable to refresh login credentials: {}", err.message()), Status::Unauthorized.code)
+            err_json!(
+                json!({"error": "invalid_grant"}),
+                format!("Unable to refresh login credentials: {}", err.message())
+            )
         }
         Ok((mut device, auth_tokens)) => {
             // Save to update `device.updated_at` to track usage and toggle new status
@@ -633,6 +640,19 @@ async fn _user_api_key_login(
         Value::Null
     };
 
+    let account_keys = if user.private_key.is_some() {
+        json!({
+            "publicKeyEncryptionKeyPair": {
+                "wrappedPrivateKey": user.private_key,
+                "publicKey": user.public_key,
+                "Object": "publicKeyEncryptionKeyPair"
+            },
+            "Object": "privateKeys"
+        })
+    } else {
+        Value::Null
+    };
+
     // Note: No refresh_token is returned. The CLI just repeats the
     // client_credentials login flow when the existing token expires.
     let result = json!({
@@ -647,7 +667,9 @@ async fn _user_api_key_login(
         "KdfMemory": user.client_kdf_memory,
         "KdfParallelism": user.client_kdf_parallelism,
         "ResetMasterPassword": false, // TODO: according to official server seems something like: user.password_hash.is_empty(), but would need testing
+        "ForcePasswordReset": false,
         "scope": AuthMethod::UserApiKey.scope(),
+        "AccountKeys": account_keys,
         "UserDecryptionOptions": {
             "HasMasterPassword": has_master_password,
             "MasterPasswordUnlock": master_password_unlock,
@@ -724,8 +746,27 @@ async fn twofactor_auth(
 
     TwoFactorIncomplete::mark_incomplete(&user.uuid, &device.uuid, &device.name, device.atype, ip, conn).await?;
 
-    let twofactor_ids: Vec<_> = twofactors.iter().map(|tf| tf.atype).collect();
+    let twofactor_ids: Vec<_> = twofactors
+        .iter()
+        .filter_map(|tf| {
+            let provider_type = TwoFactorType::from_i32(tf.atype)?;
+            (tf.enabled && is_twofactor_provider_usable(provider_type, Some(&tf.data))).then_some(tf.atype)
+        })
+        .collect();
+    if twofactor_ids.is_empty() {
+        err!("No enabled and usable two factor providers are available for this account")
+    }
+
     let selected_id = data.two_factor_provider.unwrap_or(twofactor_ids[0]); // If we aren't given a two factor provider, assume the first one
+                                                                            // Ignore Remember and RecoveryCode Types during this check, these are special
+    if ![TwoFactorType::Remember as i32, TwoFactorType::RecoveryCode as i32].contains(&selected_id)
+        && !twofactor_ids.contains(&selected_id)
+    {
+        err_json!(
+            _json_err_twofactor(&twofactor_ids, &user.uuid, data, client_version, conn).await?,
+            "Invalid two factor provider"
+        )
+    }
 
     let twofactor_code = match data.two_factor_token {
         Some(ref code) => code,
@@ -742,7 +783,6 @@ async fn twofactor_auth(
     use crate::crypto::ct_eq;
 
     let selected_data = _selected_data(selected_twofactor);
-    let mut remember = data.two_factor_remember.unwrap_or(0);
 
     match TwoFactorType::from_i32(selected_id) {
         Some(TwoFactorType::Authenticator) => {
@@ -774,13 +814,23 @@ async fn twofactor_auth(
         }
         Some(TwoFactorType::Remember) => {
             match device.twofactor_remember {
-                Some(ref code) if !CONFIG.disable_2fa_remember() && ct_eq(code, twofactor_code) => {
-                    remember = 1; // Make sure we also return the token here, otherwise it will only remember the first time
-                }
+                // When a 2FA Remember token is used, check and validate this JWT token, if it is valid, just continue
+                // If it is invalid we need to trigger the 2FA Login prompt
+                Some(ref token)
+                    if !CONFIG.disable_2fa_remember()
+                        && (ct_eq(token, twofactor_code)
+                            && auth::decode_2fa_remember(twofactor_code)
+                                .is_ok_and(|t| t.sub == device.uuid && t.user_uuid == user.uuid)) => {}
                 _ => {
+                    // Always delete the current twofactor remember token here if it exists
+                    if device.twofactor_remember.is_some() {
+                        device.delete_twofactor_remember();
+                        // We need to save here, since we send a err_json!() which prevents saving `device` at a later stage
+                        device.save(true, conn).await?;
+                    }
                     err_json!(
                         _json_err_twofactor(&twofactor_ids, &user.uuid, data, client_version, conn).await?,
-                        "2FA Remember token not provided"
+                        "2FA Remember token not provided or expired"
                     )
                 }
             }
@@ -811,10 +861,10 @@ async fn twofactor_auth(
 
     TwoFactorIncomplete::mark_complete(&user.uuid, &device.uuid, conn).await?;
 
+    let remember = data.two_factor_remember.unwrap_or(0);
     let two_factor = if !CONFIG.disable_2fa_remember() && remember == 1 {
         Some(device.refresh_twofactor_remember())
     } else {
-        device.delete_twofactor_remember();
         None
     };
     Ok(two_factor)
@@ -847,7 +897,7 @@ async fn _json_err_twofactor(
         match TwoFactorType::from_i32(*provider) {
             Some(TwoFactorType::Authenticator) => { /* Nothing to do for TOTP */ }
 
-            Some(TwoFactorType::Webauthn) if CONFIG.domain_set() => {
+            Some(TwoFactorType::Webauthn) if CONFIG.is_webauthn_2fa_supported() => {
                 let request = webauthn::generate_webauthn_login(user_id, conn).await?;
                 result["TwoFactorProviders2"][provider.to_string()] = request.0;
             }
@@ -975,12 +1025,11 @@ async fn register_verification_email(
         let user = User::find_by_mail(&data.email, &conn).await;
         if user.filter(|u| u.private_key.is_some()).is_some() {
             // There is still a timing side channel here in that the code
-            // paths that send mail take noticeably longer than ones that
-            // don't. Add a randomized sleep to mitigate this somewhat.
-            use rand::{rngs::SmallRng, Rng, SeedableRng};
-            let mut rng = SmallRng::from_os_rng();
-            let delta: i32 = 100;
-            let sleep_ms = (1_000 + rng.random_range(-delta..=delta)) as u64;
+            // paths that send mail take noticeably longer than ones that don't.
+            // Add a randomized sleep to mitigate this somewhat.
+            use rand::{rngs::SmallRng, RngExt};
+            let mut rng: SmallRng = rand::make_rng();
+            let sleep_ms = rng.random_range(900..=1100) as u64;
             tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
         } else {
             mail::send_register_verify_email(&data.email, &token).await?;
