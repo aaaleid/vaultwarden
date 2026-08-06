@@ -1,0 +1,32 @@
+#!/bin/sh
+
+# Post-deploy hook: verifies the deployed app is healthy and logs a summary.
+#
+# Environment provided by Kamal:
+#   KAMAL_RECORDED_AT, KAMAL_PERFORMER, KAMAL_VERSION, KAMAL_HOSTS,
+#   KAMAL_ROLES, KAMAL_DESTINATION, KAMAL_RUNTIME
+#
+# DOMAIN_NAME must be present in the environment that runs `kamal`
+# (the deploy workflow sets it; export it for local deploys).
+
+if [ -z "$DOMAIN_NAME" ]; then
+  echo "DOMAIN_NAME not set - skipping health verification"
+  exit 0
+fi
+
+url="https://${DOMAIN_NAME}/alive"
+max_attempts=30
+attempts=0
+
+while [ "$attempts" -lt "$max_attempts" ]; do
+  attempts=$((attempts + 1))
+  if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
+    echo "$KAMAL_PERFORMER deployed $KAMAL_VERSION to $KAMAL_DESTINATION in ${KAMAL_RUNTIME}s - healthy at $url"
+    exit 0
+  fi
+  echo "Waiting for app to become healthy (attempt $attempts/$max_attempts)..."
+  sleep 10
+done
+
+echo "Health check failed for $url after $max_attempts attempts" >&2
+exit 1

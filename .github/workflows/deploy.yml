@@ -3,44 +3,156 @@ name: Deploy Vaultwarden
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: 'Git ref (branch, tag or SHA) to deploy instead of the triggering commit'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  # Only one production deployment (or rollback) at a time.
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+  checks: read
 
 jobs:
   deploy:
     name: Deploy to Production
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag_override || github.sha }}
 
-      # إعداد Docker Buildx للكاش لسرعة بناء كمال
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # تفعيل الوصول لكاش GitHub Actions
       - name: Expose GitHub Runtime for Docker Cache
         uses: crazy-max/ghaction-github-runtime@v3
 
       - name: Set up Ruby
-        uses: actions/setup-ruby@v1
+        uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
 
       - name: Install Kamal
-        run: gem install kamal -v 2.10.1
+        run: gem install kamal -v 2.12.0
 
       - name: Set up SSH
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Deploy with Kamal
+      - name: Prepare SSH known hosts
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ vars.SERVER_IP }} >> ~/.ssh/known_hosts
-          kamal deploy
+          ssh-keyscan -H "$SERVER_IP" >> ~/.ssh/known_hosts
+        env:
+          SERVER_IP: ${{ vars.SERVER_IP }}
+
+      - name: Wait for CI checks to pass
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}/commits/${SHA}/check-runs?per_page=100"
+          auth="Authorization: Bearer ${GITHUB_TOKEN}"
+          accept="Accept: application/vnd.github+json"
+          timeout=1800
+          interval=15
+          elapsed=0
+
+          # Nothing to wait for (e.g. docs-only push) - proceed.
+          total="$(curl -fsSL -H "$auth" -H "$accept" "$api" | jq -r '.total_count')"
+          if [ "$total" -eq 0 ]; then
+            echo "::notice::No CI checks registered for ${SHA}; proceeding"
+            exit 0
+          fi
+
+          while [ "$elapsed" -lt "$timeout" ]; do
+            json="$(curl -fsSL -H "$auth" -H "$accept" "$api")"
+            pending="$(echo "$json" | jq --arg wf "$WORKFLOW_NAME" '[.check_runs[] | select(.name != $wf) | select(.status != "completed")] | length')"
+            failed="$(echo "$json" | jq --arg wf "$WORKFLOW_NAME" '[.check_runs[] | select(.name != $wf) | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')"
+
+            if [ "$failed" -gt 0 ]; then
+              echo "::error::CI checks failed for ${SHA}; aborting deployment"
+              exit 1
+            fi
+
+            if [ "$pending" -eq 0 ]; then
+              echo "::notice::All CI checks passed for ${SHA}"
+              exit 0
+            fi
+
+            echo "CI checks pending for ${SHA} (${elapsed}s elapsed)..."
+            sleep "$interval"
+            elapsed=$((elapsed + interval))
+          done
+
+          echo "::error::Timed out waiting for CI checks on ${SHA} (${timeout}s)"
+          exit 1
+
+      - name: Create GitHub deployment
+        id: deployment
+        uses: bobheadxi/deployments@v1
+        with:
+          step: start
+          token: ${{ secrets.GITHUB_TOKEN }}
+          env: production
+          ref: ${{ github.event.inputs.tag_override || github.sha }}
+
+      - name: Deploy with Kamal
+        run: kamal deploy --lock-wait
         env:
           SERVER_IP: ${{ vars.SERVER_IP }}
           DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
           DOCKER_PA_TOKEN: ${{ secrets.DOCKER_PA_TOKEN }}
-          DOCKER_BUILDKIT: 1
+
+      - name: Verify deployment health
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: |
+          set -euo pipefail
+          url="https://${DOMAIN_NAME}/alive"
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
+              echo "::notice::Deployment healthy (${url})"
+              exit 0
+            fi
+            echo "Health check attempt ${i}/30 failed; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Deployment health check failed (${url})"
+          exit 1
+
+      - name: Mark deployment successful
+        uses: bobheadxi/deployments@v1
+        with:
+          step: finish
+          token: ${{ secrets.GITHUB_TOKEN }}
+          status: success
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          env: ${{ steps.deployment.outputs.env }}
+
+      - name: Mark deployment failed
+        if: ${{ failure() && steps.deployment.outcome == 'success' }}
+        uses: bobheadxi/deployments@v1
+        with:
+          step: finish
+          token: ${{ secrets.GITHUB_TOKEN }}
+          status: failure
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          env: ${{ steps.deployment.outputs.env }}

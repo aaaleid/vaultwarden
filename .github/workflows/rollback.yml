@@ -1,0 +1,108 @@
+name: Rollback Vaultwarden
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Git SHA (KAMAL_VERSION) to roll back to - run "kamal app containers" on the server to list available versions'
+        required: true
+        default: ''
+        type: string
+
+concurrency:
+  # Serializes with deployments: no deploy while a rollback is running.
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Kamal
+        run: gem install kamal -v 2.12.0
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Prepare SSH known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$SERVER_IP" >> ~/.ssh/known_hosts
+        env:
+          SERVER_IP: ${{ vars.SERVER_IP }}
+
+      - name: Create GitHub deployment
+        id: deployment
+        uses: bobheadxi/deployments@v1
+        with:
+          step: start
+          token: ${{ secrets.GITHUB_TOKEN }}
+          env: production
+          ref: ${{ github.event.inputs.version }}
+
+      - name: Rollback with Kamal
+        run: |
+          output="$(kamal rollback "$VERSION" 2>&1)"
+          echo "$output"
+          if echo "$output" | grep -q "not available as a container"; then
+            echo "::error::Version ${VERSION} is not available as a container on the server"
+            exit 1
+          fi
+        env:
+          SERVER_IP: ${{ vars.SERVER_IP }}
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
+          DOCKER_PA_TOKEN: ${{ secrets.DOCKER_PA_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
+
+      - name: Verify rollback health
+        env:
+          DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+        run: |
+          set -euo pipefail
+          url="https://${DOMAIN_NAME}/alive"
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
+              echo "::notice::Rollback verified healthy (${url})"
+              exit 0
+            fi
+            echo "Health check attempt ${i}/20 failed; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Rollback health check failed (${url})"
+          exit 1
+
+      - name: Mark rollback successful
+        uses: bobheadxi/deployments@v1
+        with:
+          step: finish
+          token: ${{ secrets.GITHUB_TOKEN }}
+          status: success
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          env: ${{ steps.deployment.outputs.env }}
+
+      - name: Mark rollback failed
+        if: ${{ failure() && steps.deployment.outcome == 'success' }}
+        uses: bobheadxi/deployments@v1
+        with:
+          step: finish
+          token: ${{ secrets.GITHUB_TOKEN }}
+          status: failure
+          deployment_id: ${{ steps.deployment.outputs.deployment_id }}
+          env: ${{ steps.deployment.outputs.env }}

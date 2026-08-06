@@ -1,27 +1,56 @@
+# Kamal v2.12.0 deployment configuration.
+# Reference: https://kamal-deploy.org/docs/configuration/
+#
+# Secrets are resolved from .kamal/secrets. In CI they are supplied as
+# environment variables by the GitHub Actions deploy workflow; for local
+# deploys they must be exported in your shell.
+#
+# Requires Kamal >= 2.12.0.
+
 service: vaultwarden
 image: aaaleid/vaultwarden
 
+minimum_version: 2.12.0
+
 servers:
   web:
-    - <%= ENV["SERVER_IP"] %>
+    hosts:
+      - <%= ENV["SERVER_IP"] %>
+    options:
+      # Keep the container running across daemon restarts / reboots.
+      restart: unless-stopped
+
 registry:
   username: aaaleid
   password:
     - DOCKER_PA_TOKEN
 
+# kamal-proxy provides gapless (zero-downtime) deployments and automatic
+# Let's Encrypt TLS. Vaultwarden's health endpoint is /alive
+# (see docker/healthcheck.sh for the in-container HEALTHCHECK definition).
 proxy:
   ssl: true
   host: <%= ENV["DOMAIN_NAME"] %>
   app_port: 80
   healthcheck:
-    path: "/"  # Change from "/health" to "/" since Vaultwarden responds at root
-    interval: 120  # Add 's' for seconds
+    path: /alive
+    interval: 5
+    timeout: 5
+
+# How long to wait (seconds) for the app to become healthy during a deploy.
+deploy_timeout: 60
 
 ssh:
   user: ec2-user
 
 volumes:
   - "/vw-data:/data"
+
+# Docker log rotation: cap retained logs to 3 files of 10 MB each.
+logging:
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 env:
   clear:
@@ -35,5 +64,7 @@ env:
 
 builder:
   arch: amd64
+  args:
+    DB: "sqlite,mysql,postgresql"
   cache:
     type: gha
