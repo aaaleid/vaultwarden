@@ -39,10 +39,6 @@ proxy:
 
 # How long to wait (seconds) for the app to become healthy during a deploy.
 deploy_timeout: 60
-# How long to wait for in-flight connections to drain before stopping a container.
-drain_timeout: 30
-# Grace period for the container to shut down cleanly after SIGTERM.
-stop_grace_period: 30
 
 ssh:
   user: ec2-user
