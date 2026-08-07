@@ -39,9 +39,14 @@ proxy:
 
 # How long to wait (seconds) for the app to become healthy during a deploy.
 deploy_timeout: 60
+# How long to wait for in-flight connections to drain before stopping a container.
+drain_timeout: 30
+# Grace period for the container to shut down cleanly after SIGTERM.
+stop_grace_period: 30
 
 ssh:
   user: ec2-user
+  port: 22
 
 volumes:
   - "/vw-data:/data"
@@ -66,5 +71,10 @@ builder:
   arch: amd64
   args:
     DB: "sqlite,mysql,postgresql"
+    # Optional override for the embedded version string; when unset, build.rs
+    # derives it from git (the deploy workflow checks out with fetch-depth: 0).
+    <% if ENV["VW_VERSION"] && !ENV["VW_VERSION"].empty? %>
+    VW_VERSION: <%= ENV["VW_VERSION"] %>
+    <% end %>
   cache:
     type: gha

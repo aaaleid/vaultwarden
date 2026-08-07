@@ -9,6 +9,8 @@
 # In CI (GitHub Actions) the checkout is a detached HEAD of the exact commit
 # being deployed, so the branch/remote checks below are skipped.
 
+echo "Pre-build validation for version $KAMAL_VERSION (commit $(git rev-parse --short HEAD 2>/dev/null || echo unknown))..."
+
 if [ -n "$(git status --porcelain)" ]; then
   echo "Git checkout is not clean, aborting..." >&2
   git status --porcelain >&2
@@ -17,6 +19,7 @@ fi
 
 if [ -n "$GITHUB_ACTIONS" ]; then
   echo "Running in GitHub Actions - skipping branch/remote validation"
+  echo "Pre-build validation passed for version $KAMAL_VERSION"
   exit 0
 fi
 
@@ -43,4 +46,5 @@ if [ "$KAMAL_VERSION" != "$remote_head" ]; then
   exit 1
 fi
 
+echo "Pre-build validation passed for version $KAMAL_VERSION"
 exit 0

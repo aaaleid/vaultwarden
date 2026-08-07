@@ -8,6 +8,13 @@
 #
 # DOMAIN_NAME must be present in the environment that runs `kamal`
 # (the deploy workflow sets it; export it for local deploys).
+# Set KAMAL_SKIP_HEALTHCHECK=1 to skip the health verification entirely
+# (useful when debugging locally or during DNS/TLS changes).
+
+if [ "$KAMAL_SKIP_HEALTHCHECK" = "1" ]; then
+  echo "$KAMAL_PERFORMER deployed $KAMAL_VERSION to $KAMAL_DESTINATION in ${KAMAL_RUNTIME}s (healthcheck skipped)"
+  exit 0
+fi
 
 if [ -z "$DOMAIN_NAME" ]; then
   echo "DOMAIN_NAME not set - skipping health verification"
@@ -15,18 +22,26 @@ if [ -z "$DOMAIN_NAME" ]; then
 fi
 
 url="https://${DOMAIN_NAME}/alive"
-max_attempts=30
+# Allow up to ~10 minutes: DNS propagation and first-time Let's Encrypt
+# certificate issuance can take longer than the app itself.
+max_attempts=60
 attempts=0
+status=""
 
 while [ "$attempts" -lt "$max_attempts" ]; do
   attempts=$((attempts + 1))
-  if curl -fsS --max-time 10 "$url" >/dev/null 2>&1; then
+  # Capture the HTTP status so failures can distinguish a 4xx/5xx from a
+  # transport error (empty status).
+  status="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"
+
+  if [ "$status" = "200" ]; then
     echo "$KAMAL_PERFORMER deployed $KAMAL_VERSION to $KAMAL_DESTINATION in ${KAMAL_RUNTIME}s - healthy at $url"
     exit 0
   fi
-  echo "Waiting for app to become healthy (attempt $attempts/$max_attempts)..."
+
+  echo "Waiting for app to become healthy (attempt $attempts/$max_attempts, HTTP ${status:-<no response>})..."
   sleep 10
 done
 
-echo "Health check failed for $url after $max_attempts attempts" >&2
+echo "Health check failed for $url after $max_attempts attempts (last HTTP status: ${status:-<no response>})" >&2
 exit 1
