@@ -112,6 +112,55 @@ services:
 
 <br>
 
+### Kamal
+
+[Kamal](https://kamal-deploy.org) is a zero-downtime deployment tool that manages the container remotely and ships with a built-in proxy ([kamal-proxy](https://github.com/basecamp/kamal-proxy)) providing automatic TLS via Let's Encrypt.
+
+#### Prerequisites
+
+- A server with [Docker](https://docs.docker.com/engine/install/) installed, reachable over SSH
+- A domain name (and optionally subdomains) with an `A`/`AAAA` record pointing to the server
+- Inbound ports `22`, `80`, and `443` open on the server's firewall / security group
+
+#### Quick start
+
+Install Kamal locally and create the configuration:
+
+```shell
+gem install kamal
+kamal init
+```
+
+Set the required secrets (see `.kamal/secrets` for all options) and the environment variables referenced by `config/deploy.yml` (`SERVER_IP`, `DOMAIN_NAME`, `DOCKER_PA_TOKEN`, `ADMIN_TOKEN`), then bootstrap the server and deploy:
+
+```shell
+kamal setup
+```
+
+`kamal setup` installs Docker on the server if needed, starts `kamal-proxy`, and deploys the app. On subsequent releases, a plain `kamal deploy` is sufficient.
+
+#### GitHub Actions
+
+This repository also ships a [deploy workflow](.github/workflows/deploy.yml) that builds the image on GitHub-hosted runners (with `gha` build cache) and deploys to your server on every push to `main`. To use it:
+
+1. Create a `production` environment (see [GitHub docs](https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment)) with the secrets and variables below.
+2. Add the following repository secrets and variables:
+
+| Type | Name | Purpose |
+| ---- | ---- | ------- |
+| Secret | `SSH_PRIVATE_KEY` | Private key used to SSH into the server |
+| Secret | `ADMIN_TOKEN` | Vaultwarden admin panel token |
+| Secret | `DOCKER_PA_TOKEN` | Container registry access token |
+| Variable | `SERVER_IP` | Public IP or hostname of the server |
+| Variable | `DOMAIN_NAME` | Domain serving Vaultwarden |
+| Variable | `VW_VERSION` | Optional: override the embedded version string (defaults to `git describe`) |
+
+#### Configuration
+
+All Kamal settings live in `config/deploy.yml`, including the image name, server list, proxy/SSL setup, container volumes, environment variables, and build options. Secrets referenced there are resolved from `.kamal/secrets`. Adjust these files to match your own registry, server, and domain.
+
+<br>
+
 ## Get in touch
 
 Have a question, suggestion or need help? Join our community on [Matrix](https://matrix.to/#/#vaultwarden:matrix.org), [GitHub Discussions](https://github.com/dani-garcia/vaultwarden/discussions) or [Discourse Forums](https://vaultwarden.discourse.group/).
