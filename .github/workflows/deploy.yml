@@ -20,6 +20,7 @@ permissions:
   contents: read
   deployments: write
   checks: read
+  actions: read
 
 jobs:
   deploy:
@@ -73,50 +74,52 @@ jobs:
         env:
           SERVER_IP: ${{ vars.SERVER_IP }}
 
-      - name: Wait for CI checks to pass
+      - name: Wait for CI workflow runs to pass
         if: github.event_name == 'push'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          api="https://api.github.com/repos/${REPO}/commits/${SHA}/check-runs?per_page=100"
+          # Wait for other GitHub Actions workflow runs on this commit to
+          # complete before deploying. Our own run is excluded by id, so a
+          # deploy-only commit (no other CI) proceeds immediately.
           auth="Authorization: Bearer ${GITHUB_TOKEN}"
           accept="Accept: application/vnd.github+json"
+          url="https://api.github.com/repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100"
           timeout=1800
           interval=15
           elapsed=0
 
-          # Nothing to wait for (e.g. docs-only push) - proceed.
-          total="$(curl -fsSL -H "$auth" -H "$accept" "$api" | jq -r '.total_count')"
-          if [ "$total" -eq 0 ]; then
-            echo "::notice::No CI checks registered for ${SHA}; proceeding"
+          total="$(curl -fsSL -H "$auth" -H "$accept" "$url" | jq -r '.total_count')"
+          if [ "$total" -le 1 ]; then
+            echo "::notice::No other CI workflow runs for ${SHA}; proceeding"
             exit 0
           fi
 
           while [ "$elapsed" -lt "$timeout" ]; do
-            json="$(curl -fsSL -H "$auth" -H "$accept" "$api")"
-            pending="$(echo "$json" | jq --arg wf "$WORKFLOW_NAME" '[.check_runs[] | select(.name != $wf) | select(.status != "completed")] | length')"
-            failed="$(echo "$json" | jq --arg wf "$WORKFLOW_NAME" '[.check_runs[] | select(.name != $wf) | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required")] | length')"
+            json="$(curl -fsSL -H "$auth" -H "$accept" "$url")"
+            pending="$(echo "$json" | jq --argjson run "$RUN_ID" '[.workflow_runs[] | select(.id != $run) | select(.status != "completed")] | length')"
+            failed="$(echo "$json" | jq --argjson run "$RUN_ID" '[.workflow_runs[] | select(.id != $run) | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required" or .conclusion == "startup_failure")] | length')"
 
             if [ "$failed" -gt 0 ]; then
-              echo "::error::CI checks failed for ${SHA}; aborting deployment"
+              echo "::error::CI workflow runs failed for ${SHA}; aborting deployment"
               exit 1
             fi
 
             if [ "$pending" -eq 0 ]; then
-              echo "::notice::All CI checks passed for ${SHA}"
+              echo "::notice::All CI workflow runs passed for ${SHA}"
               exit 0
             fi
 
-            echo "CI checks pending for ${SHA} (${elapsed}s elapsed)..."
+            echo "CI workflow runs pending for ${SHA} (${elapsed}s elapsed)..."
             sleep "$interval"
             elapsed=$((elapsed + interval))
           done
 
-          echo "::error::Timed out waiting for CI checks on ${SHA} (${timeout}s)"
+          echo "::error::Timed out waiting for CI workflow runs on ${SHA} (${timeout}s)"
           exit 1
 
       - name: Create GitHub deployment
