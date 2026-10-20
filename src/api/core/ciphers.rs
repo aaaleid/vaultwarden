@@ -470,13 +470,6 @@ pub async fn update_cipher_from_data(
         err!("Organization mismatch. Please resync the client before updating the cipher")
     }
 
-    if let Some(note) = &data.notes {
-        let max_note_size = CONFIG._max_note_size();
-        if note.len() > max_note_size {
-            err!(format!("The field Notes exceeds the maximum encrypted value length of {max_note_size} characters."))
-        }
-    }
-
     // Check if this cipher is being transferred from a personal to an organization vault
     let transfer_cipher = cipher.organization_uuid.is_none() && data.organization_id.is_some();
 

@@ -796,12 +796,6 @@ make_config! {
         /// Enable groups (BETA!) (Know the risks!) |> Enables groups support for organizations (Currently contains known issues!).
         org_groups_enabled:            bool, false, def, false;
 
-        /// Increase note size limit (Know the risks!) |> Sets the secure note size limit to 100_000 instead of the default 10_000.
-        /// WARNING: This could cause issues with clients. Also exports will not work on Bitwarden servers!
-        increase_note_size_limit:      bool,  true,  def, false;
-        /// Generated max_note_size value to prevent if..else matching during every check
-        _max_note_size:                usize, false, generated, |c| if c.increase_note_size_limit {100_000} else {10_000};
-
         /// Enforce Single Org with Reset Password Policy |> Enforce that the Single Org policy is enabled before setting the Reset Password policy
         /// Bitwarden enforces this by default. In Vaultwarden we encouraged to use multiple organizations because groups were not available.
         /// Setting this to true will enforce the Single Org Policy to be enabled before you can enable the Reset Password policy.
@@ -1292,10 +1286,6 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         }
     }
 
-    if cfg.increase_note_size_limit {
-        println!("[WARNING] Secure Note size limit is increased to 100_000!");
-        println!("[WARNING] This could cause issues with clients. Also exports will not work on Bitwarden servers!.");
-    }
     Ok(())
 }
 

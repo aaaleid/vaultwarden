@@ -1,0 +1,1 @@
+ALTER TABLE ciphers MODIFY notes TEXT;

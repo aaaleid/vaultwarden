@@ -98,18 +98,7 @@ impl Cipher {
 
     pub fn validate_cipher_data(cipher_data: &[CipherData]) -> EmptyResult {
         let mut validation_errors = serde_json::Map::new();
-        let max_note_size = CONFIG._max_note_size();
-        let max_note_size_msg =
-            format!("The field Notes exceeds the maximum encrypted value length of {max_note_size} characters.");
         for (index, cipher) in cipher_data.iter().enumerate() {
-            // Validate the note size and if it is exceeded return a warning
-            if let Some(note) = &cipher.notes
-                && note.len() > max_note_size
-            {
-                validation_errors
-                    .insert(format!("Ciphers[{index}].Notes"), serde_json::to_value([&max_note_size_msg]).unwrap());
-            }
-
             // Validate the password history if it contains `null` values and if so, return a warning
             if let Some(Value::Array(password_history)) = &cipher.password_history {
                 for pwh in password_history {
